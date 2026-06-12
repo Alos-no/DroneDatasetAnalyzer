@@ -5,9 +5,10 @@ namespace DroneDatasetAnalyzer;
 
 /// <summary>
 /// Generates a comprehensive Markdown mission report from analysis results.
-/// Output format matches the standard mission-report template with sections for:
-/// equipment, location, mission overview, altitude/GSD, overlap, gimbal,
-/// per-day flight tables with camera settings, and methodology notes.
+/// Output format produces sections for: equipment, location, mission overview
+/// (with capture group summary), elevation/terrain (global), per-group detail
+/// (altitude/GSD, overlap, gimbal), per-day flight tables, camera summary,
+/// and methodology notes.
 /// </summary>
 public static class ReportWriter
 {
@@ -24,26 +25,31 @@ public static class ReportWriter
     writer.WriteLine("---");
     writer.WriteLine();
 
-    WriteEquipmentSection(report, writer);
-    WriteLocationSection(report, writer);
-    WriteMissionOverviewSection(report, writer);
-    WriteAltitudeGsdSection(report, writer);
-    WriteOverlapSection(report, writer);
-    WriteGimbalSection(report, writer);
-    WriteFlightTablesSection(report, writer);
-    WriteCameraSummarySection(report, writer);
-    WriteMethodologySection(report, writer);
+    int section = 1;
+
+    WriteEquipmentSection(ref section, report, writer);
+    WriteLocationSection(ref section, report, writer);
+    WriteMissionOverviewSection(ref section, report, writer);
+    WriteElevationSection(ref section, report, writer);
+
+    // Per-group detail sections (one section per capture group)
+    foreach (var group in report.CaptureGroups)
+      WriteCaptureGroupSection(ref section, group, report, writer);
+
+    WriteFlightTablesSection(ref section, report, writer);
+    WriteCameraSummarySection(ref section, report, writer);
+    WriteMethodologySection(ref section, report, writer);
   }
 
 
   #region Section writers
 
-  /// <summary>Section 1: Equipment identification.</summary>
-  private static void WriteEquipmentSection(MissionReport report, TextWriter w)
+  /// <summary>Equipment identification.</summary>
+  private static void WriteEquipmentSection(ref int section, MissionReport report, TextWriter w)
   {
     var eq = report.Equipment;
 
-    w.WriteLine("## 1. Equipment");
+    w.WriteLine($"## {section++}. Equipment");
     w.WriteLine();
     w.WriteLine("| Parameter | Value |");
     w.WriteLine("|-----------|-------|");
@@ -68,12 +74,12 @@ public static class ReportWriter
     w.WriteLine();
   }
 
-  /// <summary>Section 2: Geographic location summary.</summary>
-  private static void WriteLocationSection(MissionReport report, TextWriter w)
+  /// <summary>Geographic location summary.</summary>
+  private static void WriteLocationSection(ref int section, MissionReport report, TextWriter w)
   {
     var loc = report.Location;
 
-    w.WriteLine("## 2. Location");
+    w.WriteLine($"## {section++}. Location");
     w.WriteLine();
     w.WriteLine("| Parameter | Value |");
     w.WriteLine("|-----------|-------|");
@@ -92,17 +98,17 @@ public static class ReportWriter
     w.WriteLine();
   }
 
-  /// <summary>Section 3: Mission overview with summary statistics.</summary>
-  private static void WriteMissionOverviewSection(MissionReport report, TextWriter w)
+  /// <summary>Mission overview with summary statistics and capture group table.</summary>
+  private static void WriteMissionOverviewSection(ref int section, MissionReport report, TextWriter w)
   {
-    w.WriteLine("## 3. Mission Overview");
+    w.WriteLine($"## {section++}. Mission Overview");
     w.WriteLine();
     w.WriteLine("| Parameter | Value |");
     w.WriteLine("|-----------|-------|");
     w.WriteLine($"| **Total Photos** | {report.TotalPhotos:N0} |");
     w.WriteLine($"| **Capture Days** | {report.CaptureDays} ({string.Join(", ", report.Dates.Select(d => d.ToString("yyyy-MM-dd")))}) |");
     w.WriteLine($"| **Flights** | {report.Flights.Count} |");
-    w.WriteLine($"| **Battery Swaps** | ~{report.BatterySwaps} |");
+    w.WriteLine($"| **Capture Groups** | {report.CaptureGroups.Count} |");
     w.WriteLine($"| **Total Capture Time** | {FormatTimeSpan(report.TotalCaptureTime)} |");
 
     // RTK status from sampled data
@@ -120,71 +126,143 @@ public static class ReportWriter
     }
 
     w.WriteLine();
+
+    // Capture group summary table
+    if (report.CaptureGroups.Count > 1)
+    {
+      w.WriteLine("### Capture Groups");
+      w.WriteLine();
+      w.WriteLine("| Group | Flights | Photos | Altitude | GSD | Fwd Overlap | Side Overlap |");
+      w.WriteLine("|-------|---------|--------|----------|-----|-------------|--------------|");
+
+      foreach (var group in report.CaptureGroups)
+      {
+        string altStr = group.BandAltitude != null
+          ? $"{group.BandAltitude:F0} m"
+          : group.MinAltitude != null && group.MaxAltitude != null
+            ? $"{group.MinAltitude:F0}–{group.MaxAltitude:F0} m"
+            : "—";
+
+        string gsdStr = group.Overlap != null
+          ? $"{group.Overlap.GsdMeters * 100:F2} cm/px"
+          : "—";
+
+        string fwdStr = group.Overlap != null
+          ? $"{group.Overlap.ForwardOverlap * 100:F0}%"
+          : "—";
+
+        string sideStr = group.Overlap != null
+          ? $"{group.Overlap.SideOverlap * 100:F0}%"
+          : "—";
+
+        w.WriteLine($"| {group.Label} | {group.Flights.Count} | {group.TotalPhotos:N0} | {altStr} | {gsdStr} | {fwdStr} | {sideStr} |");
+      }
+
+      w.WriteLine();
+    }
   }
 
-  /// <summary>Section 4: Altitude, GSD, and footprint geometry.</summary>
-  private static void WriteAltitudeGsdSection(MissionReport report, TextWriter w)
+  /// <summary>Global elevation/terrain section (shared across all groups).</summary>
+  private static void WriteElevationSection(ref int section, MissionReport report, TextWriter w)
   {
-    var ov = report.Overlap;
+    if (report.Elevation == null)
+      return;
 
-    w.WriteLine("## 4. Altitude & GSD");
+    var el = report.Elevation;
+
+    w.WriteLine($"## {section++}. Elevation & Terrain");
     w.WriteLine();
     w.WriteLine("| Parameter | Value |");
     w.WriteLine("|-----------|-------|");
-    w.WriteLine($"| **Flight Altitude (relative)** | {ov.PrimaryAltitude:F1} m above takeoff |");
+    w.WriteLine($"| **AGL (above terrain)** | {el.MeanAgl:F1} m mean, {el.MedianAgl:F1} m median (range {el.MinAgl:F1}–{el.MaxAgl:F1} m) |");
+    w.WriteLine($"| **Ground Elevation** | {el.MeanGroundElevation:F1} m MSL (EGM96) |");
+    w.WriteLine($"| **Drone Altitude** | {el.MeanDroneAltitudeMsl:F1} m MSL (EGM96) |");
+    w.WriteLine();
+    w.WriteLine("*AGL computed from `DJI_AbsoluteAltitude - SRTM_GroundElevation`. Both use EGM96 geoid datum.*");
+    w.WriteLine();
+  }
 
-    if (report.Elevation != null)
+  /// <summary>Per-capture-group section with altitude/GSD, overlap, and gimbal detail.</summary>
+  private static void WriteCaptureGroupSection(
+    ref int section,
+    CaptureGroup group,
+    MissionReport report,
+    TextWriter w)
+  {
+    w.WriteLine($"## {section++}. {group.Label}");
+    w.WriteLine();
+
+    // Summary line
+    string flightIndexes = string.Join(", ", group.Flights.Select(f => $"#{f.Index}"));
+    w.WriteLine($"*{group.TotalPhotos:N0} photos across {group.Flights.Count} flight(s) ({flightIndexes})*");
+    w.WriteLine();
+
+    // ── Altitude & GSD ──
+    if (group.Overlap != null)
     {
-      var el = report.Elevation;
-      w.WriteLine($"| **AGL (above terrain)** | {el.MeanAgl:F1} m mean, {el.MedianAgl:F1} m median (range {el.MinAgl:F1}-{el.MaxAgl:F1} m) |");
-      w.WriteLine($"| **Ground Elevation** | {el.MeanGroundElevation:F1} m MSL (EGM96) |");
-      w.WriteLine($"| **Drone Altitude** | {el.MeanDroneAltitudeMsl:F1} m MSL (EGM96) |");
+      var ov = group.Overlap;
+
+      w.WriteLine("### Altitude & GSD");
+      w.WriteLine();
+      w.WriteLine("| Parameter | Value |");
+      w.WriteLine("|-----------|-------|");
+      w.WriteLine($"| **Flight Altitude (relative)** | {ov.PrimaryAltitude:F1} m above takeoff |");
+      w.WriteLine($"| **GSD** | {ov.GsdMeters * 100:F2} cm/px |");
+      w.WriteLine($"| **Footprint** | {ov.FootprintWidthMeters:F1} x {ov.FootprintHeightMeters:F1} m |");
+      w.WriteLine($"| **Ground Speed** | {ov.MeanGroundSpeed:F1} m/s |");
+      w.WriteLine();
+      w.WriteLine($"*GSD = altitude / calibrated_focal_length_px = {ov.PrimaryAltitude:F1} / " +
+        $"{report.Equipment.CalibratedFocalLengthPx:F1} = {ov.GsdMeters * 100:F2} cm/px*");
+      w.WriteLine();
+
+      // ── Overlap ──
+      w.WriteLine("### Overlap & Coverage");
+      w.WriteLine();
+      w.WriteLine("| Parameter | Value |");
+      w.WriteLine("|-----------|-------|");
+      w.WriteLine($"| **Forward Overlap** | {ov.ForwardOverlap * 100:F0}% |");
+      w.WriteLine($"| **Side Overlap** | {ov.SideOverlap * 100:F0}% |");
+      w.WriteLine($"| **Forward Spacing** | {ov.ForwardSpacingMeters:F1} m between nadir shots |");
+      w.WriteLine($"| **Side Spacing** | {ov.SideSpacingMeters:F1} m between flight lines |");
+      w.WriteLine($"| **Footprint** | {ov.FootprintWidthMeters:F1} m (W) x {ov.FootprintHeightMeters:F1} m (H) |");
+      w.WriteLine($"| **Samples (fwd/side)** | {ov.ForwardSampleCount} / {ov.SideSampleCount} measurement pairs |");
+      w.WriteLine();
+    }
+    else if (group.MinAltitude != null && group.MaxAltitude != null)
+    {
+      // Unclassified group — show altitude range only
+      w.WriteLine("### Altitude");
+      w.WriteLine();
+      w.WriteLine("| Parameter | Value |");
+      w.WriteLine("|-----------|-------|");
+      w.WriteLine($"| **Altitude Range** | {group.MinAltitude:F0}–{group.MaxAltitude:F0} m |");
+      w.WriteLine();
+      w.WriteLine("*Overlap not computed for varying-altitude flights.*");
+      w.WriteLine();
     }
 
-    w.WriteLine($"| **GSD** | {ov.GsdMeters * 100:F2} cm/px |");
-    w.WriteLine($"| **Footprint** | {ov.FootprintWidthMeters:F1} x {ov.FootprintHeightMeters:F1} m |");
-    w.WriteLine($"| **Ground Speed** | {ov.MeanGroundSpeed:F1} m/s |");
-    w.WriteLine();
-
-    // GSD formula explanation
-    w.WriteLine($"*GSD = altitude / calibrated_focal_length_px = {ov.PrimaryAltitude:F1} / ");
-    w.Write($"{report.Equipment.CalibratedFocalLengthPx:F1} = {ov.GsdMeters * 100:F2} cm/px*");
-    w.WriteLine();
-    w.WriteLine();
-  }
-
-  /// <summary>Section 5: Forward and side overlap analysis.</summary>
-  private static void WriteOverlapSection(MissionReport report, TextWriter w)
-  {
-    var ov = report.Overlap;
-
-    w.WriteLine("## 5. Overlap & Coverage Geometry");
+    // ── Gimbal ──
+    var gim = group.Gimbal;
+    w.WriteLine("### Gimbal Configuration");
     w.WriteLine();
     w.WriteLine("| Parameter | Value |");
     w.WriteLine("|-----------|-------|");
-    w.WriteLine($"| **Forward Overlap** | {ov.ForwardOverlap * 100:F0}% |");
-    w.WriteLine($"| **Side Overlap** | {ov.SideOverlap * 100:F0}% |");
-    w.WriteLine($"| **Forward Spacing** | {ov.ForwardSpacingMeters:F1} m between nadir shots |");
-    w.WriteLine($"| **Side Spacing** | {ov.SideSpacingMeters:F1} m between flight lines |");
-    w.WriteLine($"| **Footprint** | {ov.FootprintWidthMeters:F1} m (W) x {ov.FootprintHeightMeters:F1} m (H) |");
-    w.WriteLine($"| **Samples (fwd/side)** | {ov.ForwardSampleCount} / {ov.SideSampleCount} measurement pairs |");
-    w.WriteLine();
-  }
 
-  /// <summary>Section 6: Gimbal and smart oblique configuration.</summary>
-  private static void WriteGimbalSection(MissionReport report, TextWriter w)
-  {
-    var gim = report.Gimbal;
+    if (gim.HasSmartOblique)
+    {
+      w.WriteLine($"| **Mode** | Smart Oblique |");
+      w.WriteLine($"| **Configured Angle** | {Math.Abs(gim.ObliqueAngle):F0}° from vertical |");
+      w.WriteLine($"| **Forward Look** | pitch {gim.MeanForwardPitch:F1}° (roll~0°) — {gim.ObliqueForwardCount} shots |");
+      w.WriteLine($"| **Backward Look** | pitch {gim.MeanBackwardPitch:F1}° (roll~180°) — {gim.ObliqueBackwardCount} shots |");
+      w.WriteLine($"| **Nadir** | {gim.NadirCount} shots ({100.0 * gim.NadirCount / Math.Max(1, gim.TotalSampled):F0}%) |");
+    }
+    else
+    {
+      w.WriteLine($"| **Mode** | Fixed |");
+      w.WriteLine($"| **Mean Pitch** | {gim.MeanPitch:F1}° |");
+      w.WriteLine($"| **Nadir** | {gim.NadirCount} shots ({100.0 * gim.NadirCount / Math.Max(1, gim.TotalSampled):F0}%) |");
+    }
 
-    w.WriteLine("## 6. Gimbal & Smart Oblique Configuration");
-    w.WriteLine();
-    w.WriteLine("| Parameter | Value |");
-    w.WriteLine("|-----------|-------|");
-    w.WriteLine($"| **Mode** | Smart Oblique |");
-    w.WriteLine($"| **Configured Angle** | {Math.Abs(gim.ObliqueAngle):F0}° from vertical |");
-    w.WriteLine($"| **Forward Look** | pitch {gim.MeanForwardPitch:F1}° (roll~0°) — {gim.ObliqueForwardCount} shots |");
-    w.WriteLine($"| **Backward Look** | pitch {gim.MeanBackwardPitch:F1}° (roll~180°) — {gim.ObliqueBackwardCount} shots |");
-    w.WriteLine($"| **Nadir** | {gim.NadirCount} shots ({100.0 * gim.NadirCount / Math.Max(1, gim.TotalSampled):F0}%) |");
     w.WriteLine($"| **Total Sampled** | {gim.TotalSampled} photos |");
     w.WriteLine();
 
@@ -195,16 +273,18 @@ public static class ReportWriter
     }
   }
 
-  /// <summary>Section 7: Per-day flight tables with camera settings per flight.</summary>
-  private static void WriteFlightTablesSection(MissionReport report, TextWriter w)
+  /// <summary>Per-day flight tables with camera settings per flight. Includes group column.</summary>
+  private static void WriteFlightTablesSection(ref int section, MissionReport report, TextWriter w)
   {
-    w.WriteLine("## 7. Flight Details");
+    w.WriteLine($"## {section++}. Flight Details");
     w.WriteLine();
 
     // Group flights by date
     var flightsByDate = report.Flights
       .GroupBy(f => DateOnly.FromDateTime(f.StartTime))
       .OrderBy(g => g.Key);
+
+    bool hasMultipleGroups = report.CaptureGroups.Count > 1;
 
     foreach (var dayGroup in flightsByDate)
     {
@@ -215,9 +295,17 @@ public static class ReportWriter
       w.WriteLine($"### {dayGroup.Key:yyyy-MM-dd} — {flights.Count} flights, {dayPhotos:N0} photos, {FormatTimeSpan(dayDuration)}");
       w.WriteLine();
 
-      // Table header
-      w.WriteLine("| # | Time | Duration | Photos | Alt (m) | Speed (m/s) | Shutter | f/ | ISO | Gap |");
-      w.WriteLine("|---|------|----------|--------|---------|-------------|---------|-----|-----|-----|");
+      // Table header — include Group column when there are multiple capture groups
+      if (hasMultipleGroups)
+      {
+        w.WriteLine("| # | Group | Time | Duration | Photos | Alt (m) | Speed (m/s) | Shutter | f/ | ISO | Gap |");
+        w.WriteLine("|---|-------|------|----------|--------|---------|-------------|---------|-----|-----|-----|");
+      }
+      else
+      {
+        w.WriteLine("| # | Time | Duration | Photos | Alt (m) | Speed (m/s) | Shutter | f/ | ISO | Gap |");
+        w.WriteLine("|---|------|----------|--------|---------|-------------|---------|-----|-----|-----|");
+      }
 
       foreach (var flight in flights)
       {
@@ -244,20 +332,30 @@ public static class ReportWriter
         // Gap before this flight
         string gapStr = flight.GapBefore != null ? FormatTimeSpan(flight.GapBefore.Value) : "—";
 
-        w.WriteLine($"| {flight.Index} | {timeRange} | {FormatTimeSpan(flight.Duration)} | " +
-          $"{flight.PhotoCount:N0} | {altStr} | {speedStr} | {shutterStr} | {fStr} | {isoStr} | {gapStr} |");
+        if (hasMultipleGroups)
+        {
+          string groupLabel = flight.CaptureGroupLabel ?? "—";
+
+          w.WriteLine($"| {flight.Index} | {groupLabel} | {timeRange} | {FormatTimeSpan(flight.Duration)} | " +
+            $"{flight.PhotoCount:N0} | {altStr} | {speedStr} | {shutterStr} | {fStr} | {isoStr} | {gapStr} |");
+        }
+        else
+        {
+          w.WriteLine($"| {flight.Index} | {timeRange} | {FormatTimeSpan(flight.Duration)} | " +
+            $"{flight.PhotoCount:N0} | {altStr} | {speedStr} | {shutterStr} | {fStr} | {isoStr} | {gapStr} |");
+        }
       }
 
       w.WriteLine();
     }
   }
 
-  /// <summary>Section 8: Camera settings summary across all flights.</summary>
-  private static void WriteCameraSummarySection(MissionReport report, TextWriter w)
+  /// <summary>Camera settings summary across all flights.</summary>
+  private static void WriteCameraSummarySection(ref int section, MissionReport report, TextWriter w)
   {
     var allSamples = report.Flights.SelectMany(f => f.SampledPhotos).ToList();
 
-    w.WriteLine("## 8. Camera Settings Summary");
+    w.WriteLine($"## {section++}. Camera Settings Summary");
     w.WriteLine();
 
     // Exposure time distribution
@@ -318,13 +416,14 @@ public static class ReportWriter
     }
   }
 
-  /// <summary>Section 9: Methodology notes.</summary>
-  private static void WriteMethodologySection(MissionReport report, TextWriter w)
+  /// <summary>Methodology notes.</summary>
+  private static void WriteMethodologySection(ref int section, MissionReport report, TextWriter w)
   {
-    w.WriteLine("## 9. Methodology Notes");
+    w.WriteLine($"## {section++}. Methodology Notes");
     w.WriteLine();
     w.WriteLine("- **Filename Parsing**: Timestamps extracted from DJI filename convention (`DJI_YYYYMMDDHHMMSS_NNNN_V.jpg`) for zero-I/O timeline construction.");
-    w.WriteLine("- **Flight Segmentation**: Raw segments split at >30s gaps, merged if gap <120s and DJI sequence number doesn't reset to 1 (indicating power cycle/battery swap).");
+    w.WriteLine("- **Flight Segmentation**: Raw segments split at >30s gaps, merged if gap <120s and DJI sequence number doesn't reset to 1 (indicating a power cycle).");
+    w.WriteLine("- **Capture Group Classification**: Flights classified by altitude stability (std dev ≤ 10 m = stable). Stable flights grouped by median altitude rounded to nearest 5 m. Groups below 30 photos merged into a varying-altitude catch-all group.");
     w.WriteLine("- **Metadata Sampling**: EXIF and DJI XMP read from evenly-spaced sample photos per flight. Raw binary EXIF parsing and regex XMP extraction from first 128KB of each JPEG.");
     w.WriteLine("- **Forward Overlap**: Median haversine distance between consecutive nadir shots on the same heading, divided by footprint height.");
     w.WriteLine("- **Side Overlap**: Median cross-track distance at heading-reversal points (flight line changes), divided by footprint width.");

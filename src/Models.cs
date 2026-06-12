@@ -144,7 +144,7 @@ public sealed class PhotoMetadata
 }
 
 /// <summary>
-/// Aggregated data for one continuous flight (between battery swaps).
+/// Aggregated data for one continuous flight (between power cycles).
 /// </summary>
 public sealed class FlightInfo
 {
@@ -156,6 +156,9 @@ public sealed class FlightInfo
 
   /// <summary>Photos with full XMP+EXIF metadata (sampled subset).</summary>
   public List<PhotoMetadata> SampledPhotos { get; } = [];
+
+  /// <summary>Short label of the capture group this flight was classified into (e.g., "110 m" or "Mixed").</summary>
+  public string? CaptureGroupLabel { get; set; }
 
   /// <summary>Time gap before this flight (null for first flight).</summary>
   public TimeSpan? GapBefore { get; set; }
@@ -201,6 +204,12 @@ public sealed class GimbalAnalysis
 
   /// <summary>Mean backward-look oblique pitch in degrees (typically -(90 - |ObliqueAngle|)).</summary>
   public double MeanBackwardPitch { get; set; }
+
+  /// <summary>Mean gimbal pitch across all sampled photos (degrees, negative = downward).</summary>
+  public double MeanPitch { get; set; }
+
+  /// <summary>True if the gimbal was operating in smart oblique mode (forward + backward oblique shots detected).</summary>
+  public bool HasSmartOblique => ObliqueForwardCount > 0 && ObliqueBackwardCount > 0;
 
   /// <summary>Human-readable explanation of the oblique correlation.</summary>
   public string Explanation { get; set; } = "";
@@ -361,20 +370,14 @@ public sealed class MissionReport
   /// <summary>Per-flight breakdown.</summary>
   public List<FlightInfo> Flights { get; } = [];
 
-  /// <summary>Gimbal and smart oblique analysis.</summary>
-  public GimbalAnalysis Gimbal { get; set; } = new();
-
-  /// <summary>Forward and side overlap results.</summary>
-  public OverlapAnalysis Overlap { get; set; } = new();
+  /// <summary>Capture groups classified by altitude band, each with independent analysis.</summary>
+  public List<CaptureGroup> CaptureGroups { get; } = [];
 
   /// <summary>Elevation and AGL analysis (null if API unavailable).</summary>
   public ElevationAnalysis? Elevation { get; set; }
 
   /// <summary>Total photo count across all flights.</summary>
   public int TotalPhotos { get; set; }
-
-  /// <summary>Number of battery swaps (flights - 1 for flights on the same day).</summary>
-  public int BatterySwaps { get; set; }
 
   /// <summary>Number of distinct capture days.</summary>
   public int CaptureDays { get; set; }
@@ -384,6 +387,41 @@ public sealed class MissionReport
 
   /// <summary>Total capture time across all flights.</summary>
   public TimeSpan TotalCaptureTime { get; set; }
+}
+
+/// <summary>
+/// A group of flights classified by altitude band for independent analysis.
+/// Classified groups share a consistent flight altitude; the unclassified group
+/// contains flights with varying altitude or too few photos to form a distinct band.
+/// </summary>
+public sealed class CaptureGroup
+{
+  /// <summary>Display label (e.g., "Capture at 110 m" or "Varying altitude").</summary>
+  public required string Label { get; init; }
+
+  /// <summary>Band altitude in meters, rounded to nearest 5m (null for the unclassified group).</summary>
+  public double? BandAltitude { get; init; }
+
+  /// <summary>True if this is the unclassified catch-all group (varying altitude / below threshold).</summary>
+  public bool IsUnclassified { get; init; }
+
+  /// <summary>Flights in this capture group.</summary>
+  public List<FlightInfo> Flights { get; } = [];
+
+  /// <summary>Total photo count across all flights in this group.</summary>
+  public int TotalPhotos => Flights.Sum(f => f.PhotoCount);
+
+  /// <summary>Overlap and coverage analysis (null for unclassified groups or insufficient data).</summary>
+  public OverlapAnalysis? Overlap { get; set; }
+
+  /// <summary>Gimbal and smart oblique analysis.</summary>
+  public GimbalAnalysis Gimbal { get; set; } = new();
+
+  /// <summary>Minimum relative altitude across sampled photos.</summary>
+  public double? MinAltitude { get; set; }
+
+  /// <summary>Maximum relative altitude across sampled photos.</summary>
+  public double? MaxAltitude { get; set; }
 }
 
 /// <summary>

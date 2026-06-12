@@ -2,18 +2,21 @@
 
 A zero-dependency .NET CLI tool that analyzes DJI drone photo datasets. Extracts flight timelines, camera settings, overlap geometry, gimbal configuration, altitude/GSD, and terrain elevation from EXIF + XMP metadata.
 
-Takes a directory of thousands of photos and produces a comprehensive mission report in seconds — no image processing, no external libraries, just raw metadata parsing.
+Takes one or more directories of photos and produces a comprehensive mission report in seconds — no image processing, no external libraries, just raw metadata parsing.
 
 ## Features
 
-- **Flight Timeline** — Segments photos into flights by detecting battery swaps (timestamp gaps + DJI sequence resets)
+- **Capture Group Classification** — Automatically groups flights by altitude band (stable-altitude flights clustered, varying-altitude flights in a catch-all group) with per-group analysis
+- **Flight Timeline** — Segments photos into flights by detecting power cycles (timestamp gaps + DJI sequence resets)
 - **Camera Settings** — Shutter speed, aperture, ISO, focal length per flight
-- **Forward & Side Overlap** — Computed from consecutive GPS positions and flight-line geometry
+- **Forward & Side Overlap** — Computed from consecutive GPS positions and flight-line geometry, per capture group
 - **Smart Oblique Analysis** — Correlates gimbal pitch, roll, and yaw to determine the real oblique angle setting
 - **GSD & Footprint** — Ground sample distance and footprint from DJI calibrated focal length
 - **Terrain Elevation** — Queries Open-Meteo SRTM API for ground elevation and above-ground-level computation
 - **Equipment ID** — Drone model, serial numbers, sensor specs from XMP metadata
-- **Per-Flight Breakdown** — Day-by-day tables with photo counts, durations, and camera parameters
+- **Per-Flight Breakdown** — Day-by-day tables with photo counts, durations, camera parameters, and group labels
+- **Multi-Directory Support** — Merge photos from multiple folders (common when flights are split across subfolders)
+- **Recursive Search** — Automatically finds all JPEG files in subdirectories
 
 ## Quick Start
 
@@ -23,7 +26,7 @@ git clone https://github.com/Alos-no/DroneDatasetAnalyzer.git
 cd DroneDatasetAnalyzer
 dotnet build src/DroneDatasetAnalyzer.csproj
 
-# Analyze a dataset
+# Analyze a dataset (searches recursively)
 dotnet run --project src/DroneDatasetAnalyzer.csproj -- "/path/to/drone/photos"
 ```
 
@@ -36,13 +39,15 @@ DroneDatasetAnalyzer "/path/to/drone/photos"
 ## Usage
 
 ```
-DroneDatasetAnalyzer <directory> [options]
+DroneDatasetAnalyzer <directory> [directory2 ...] [options]
 
 Arguments:
-  <directory>                 Path to directory containing DJI drone photos
+  <directory>                 One or more directories containing DJI drone photos.
+                              Each directory is searched recursively for JPEG files.
+                              Photos from all directories are merged and analyzed together.
 
 Options:
-  -o, --output <path>         Output report path (default: MISSION-REPORT.md in dataset dir)
+  -o, --output <path>         Output report path (default: MISSION-REPORT.md in first dir)
   -s, --samples <n>           Samples per flight for metadata (default: 9)
   -b, --overlap-block <n>     Consecutive photos for overlap (default: 500)
   --skip-elevation            Skip elevation API query (faster, no AGL)
@@ -52,43 +57,64 @@ Options:
 ### Examples
 
 ```bash
-# Basic analysis (writes MISSION-REPORT.md in the dataset directory)
-DroneDatasetAnalyzer "D:\Flights\Mission_001"
+# Analyze a dataset with photos in subfolders (common DJI folder structure)
+DroneDatasetAnalyzer "D:\Flights\2026-05-03_Site\M4E"
+
+# Analyze multiple flight directories together
+DroneDatasetAnalyzer "D:\Flight_001" "D:\Flight_002" "D:\Flight_003" -o report.md
 
 # Custom output path, more samples per flight
-DroneDatasetAnalyzer "D:\Flights\Mission_001" -o report.md --samples 15
+DroneDatasetAnalyzer "D:\Flights\Flight_001" -o report.md --samples 15
 
 # Skip elevation API (no internet needed)
-DroneDatasetAnalyzer "D:\Flights\Mission_001" --skip-elevation
+DroneDatasetAnalyzer "D:\Flights\Flight_001" --skip-elevation
 ```
 
 ## Sample Output
 
 ```
 ═══ MISSION SUMMARY ═══
-  Platform:     DJI Matrice 4E
-  Photos:       20,184 across 3 day(s)
-  Flights:      20 (17 battery swaps)
-  Altitude:     110 m (relative)
-  GSD:          2.95 cm/px
-  Overlap:      78% forward, 75% side
-  Gimbal:       Smart Oblique at 45°
-  Capture Time: 4h 59m
+  Platform:       DJI Matrice 4E
+  Photos:         5,391 across 1 day(s)
+  Flights:        5
+  Capture Groups: 4
+  Capture Time:   1h 58m
+
+  ── Capture at 105 m (1,883 photos, 1 flight(s)) ──
+     Altitude: 105 m  |  GSD: 2.82 cm/px
+     Overlap:  77% forward, 79% side
+     Gimbal:   Smart Oblique at 50°
+
+  ── Capture at 90 m (1,698 photos, 1 flight(s)) ──
+     Altitude: 90 m  |  GSD: 2.42 cm/px
+     Overlap:  73% forward, 75% side
+     Gimbal:   Smart Oblique at 50°
+
+  ── Capture at 40 m (398 photos, 1 flight(s)) ──
+     Altitude: 40 m  |  GSD: 1.07 cm/px
+     Overlap:  0% forward, 0% side
+     Gimbal:   Fixed pitch -21.1°
+
+  ── Varying altitude (1,412 photos, 2 flight(s)) ──
+     Altitude: 30–83 m range
+     Gimbal:   Fixed pitch -18.1°
 ```
 
-The tool also generates a full Markdown report with 9 sections: Equipment, Location, Mission Overview, Altitude & GSD, Overlap & Coverage, Gimbal Configuration, Per-Day Flight Tables (with camera settings), Camera Summary, and Methodology Notes.
+The tool generates a full Markdown report with dynamic sections: Equipment, Location, Mission Overview (with capture group summary table), Elevation & Terrain (global), one section per capture group (with full Altitude/GSD, Overlap, and Gimbal detail), Flight Details (per-day tables with group labels), Camera Summary, and Methodology Notes.
 
 ## How It Works
 
 The analysis pipeline is designed for speed — it reads as few files as possible:
 
-1. **Filename Parsing** (0 file reads) — Extracts timestamps and sequence numbers from DJI's `DJI_YYYYMMDDHHMMSS_NNNN_V.jpg` naming convention
-2. **Flight Segmentation** (0 file reads) — Splits at >30s gaps, merges brief pauses unless the sequence counter resets (= power cycle)
-3. **Metadata Sampling** (~180 file reads) — Reads EXIF + XMP from 9 evenly-spaced photos per flight
-4. **Overlap Block** (~500 file reads) — Reads a consecutive block for precise forward/side overlap
-5. **Elevation API** (~40 HTTP requests) — Queries SRTM ground elevation for AGL computation
+1. **Directory Scanning** (0 file reads) — Recursively finds all JPEG files across input directories
+2. **Filename Parsing** (0 file reads) — Extracts timestamps and sequence numbers from DJI's `DJI_YYYYMMDDHHMMSS_NNNN_V.jpg` naming convention
+3. **Flight Segmentation** (0 file reads) — Splits at >30s gaps, merges brief pauses unless the sequence counter resets (= power cycle)
+4. **Metadata Sampling** (~45 file reads) — Reads EXIF + XMP from 9 evenly-spaced photos per flight
+5. **Capture Group Classification** (0 file reads) — Groups flights by altitude band using sampled metadata
+6. **Per-Group Overlap Block** (~500 file reads per classified group) — Reads consecutive photos for overlap computation within each altitude band
+7. **Elevation API** (~10 HTTP requests) — Queries SRTM ground elevation for AGL computation
 
-Total: ~680 file reads for a 20,000-photo dataset. Analysis completes in 10–15 seconds on a local SSD, or 30–60 seconds over a network share.
+Total: ~1,500+ file reads for a 5,000-photo multi-group dataset. Analysis completes in ~30 seconds over a network share, or a few seconds on local SSD.
 
 ### Metadata Sources
 

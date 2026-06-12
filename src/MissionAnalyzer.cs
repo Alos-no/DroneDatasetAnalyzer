@@ -13,69 +13,92 @@ namespace DroneDatasetAnalyzer;
 /// </summary>
 public static class MissionAnalyzer
 {
+  /// <summary>Altitude std dev threshold (meters): flights above this have varying altitude.</summary>
+  private const double AltitudeStabilityThreshold = 10.0;
+
+  /// <summary>Minimum total photos for an altitude band to form its own capture group.</summary>
+  private const int MinPhotosPerCaptureGroup = 30;
+
+
   #region Public API
 
   /// <summary>
-  /// Runs the complete analysis pipeline on a directory of DJI drone photos.
+  /// Runs the complete analysis pipeline on one or more directories of DJI drone photos.
+  /// When multiple directories are given, photos from all directories are merged into
+  /// a single timeline and analyzed together (common when flights are split across folders).
   /// </summary>
-  /// <param name="directory">Path to the directory containing JPEG photos.</param>
+  /// <param name="directories">Paths to directories containing JPEG photos. Searched recursively.</param>
   /// <param name="options">Analysis configuration.</param>
   /// <param name="log">Progress callback for console output.</param>
   /// <returns>Complete mission report with all analysis results.</returns>
   public static async Task<MissionReport> AnalyzeAsync(
-    string directory,
+    string[] directories,
     AnalysisOptions options,
     Action<string> log)
   {
     // Step 1: List all JPEG files and parse DJI filenames (zero I/O beyond directory listing)
-    log("Scanning directory for DJI photos...");
-    var allFiles = ParseDjiFilenames(directory);
+    log($"Scanning {directories.Length} director{(directories.Length == 1 ? "y" : "ies")} for DJI photos...");
+    var allFiles = ParseDjiFilenames(directories);
     log($"  Found {allFiles.Count:N0} DJI photos");
 
     if (allFiles.Count == 0)
-      throw new InvalidOperationException("No DJI photos found in the specified directory.");
+      throw new InvalidOperationException("No DJI photos found in the specified directories.");
 
     // Step 2: Segment into flights based on timestamp gaps and sequence resets
     log("Segmenting into flights...");
     var flights = SegmentIntoFlights(allFiles);
-    log($"  Identified {flights.Count} flights across {flights.Select(f => f.StartTime.Date).Distinct().Count()} days");
+    log($"  Identified {flights.Count} flights across {flights.Select(f => f.StartTime.Date).Distinct().Count()} day(s)");
 
     // Step 3: Read metadata from sampled photos per flight
     log($"Reading metadata ({options.SamplesPerFlight} samples/flight)...");
-    int totalSampled = 0;
 
     for (int i = 0; i < flights.Count; i++)
     {
       SampleFlightMetadata(flights[i], options.SamplesPerFlight);
-      totalSampled += flights[i].SampledPhotos.Count;
       log($"  Flight {i + 1}/{flights.Count}: read {flights[i].SampledPhotos.Count} photos ({flights[i].PhotoCount:N0} total)");
     }
 
-    // Step 4: Read a consecutive block for overlap analysis
-    log($"Reading consecutive block for overlap analysis ({options.OverlapBlockSize} photos)...");
-    var overlapBlock = ReadConsecutiveBlockForOverlap(flights, options.OverlapBlockSize, log);
-    log($"  Read {overlapBlock.Count} consecutive photos for overlap computation");
+    // Step 4: Classify flights into capture groups by altitude band
+    log("Classifying flights into capture groups...");
+    var captureGroups = ClassifyFlightsIntoCaptureGroups(flights);
 
-    // Collect all sampled photos across flights for aggregate analyses
+    foreach (var group in captureGroups)
+      log($"  {group.Label} — {group.Flights.Count} flight(s), {group.TotalPhotos:N0} photos");
+
+    // Step 5: Per-group analysis (overlap + gimbal)
+    foreach (var group in captureGroups)
+    {
+      log($"Analyzing: {group.Label}...");
+      var groupSamples = group.Flights.SelectMany(f => f.SampledPhotos).ToList();
+
+      // Gimbal analysis for all groups
+      log("  Analyzing gimbal configuration...");
+      group.Gimbal = AnalyzeGimbal(groupSamples);
+
+      // Overlap analysis only for classified (stable-altitude) groups
+      if (!group.IsUnclassified)
+      {
+        log($"  Reading overlap block ({options.OverlapBlockSize} photos)...");
+        var overlapBlock = ReadConsecutiveBlockForOverlap(group.Flights, options.OverlapBlockSize, log);
+        log($"  Read {overlapBlock.Count} consecutive photos for overlap computation");
+
+        if (overlapBlock.Count > 0)
+        {
+          log("  Computing overlap...");
+          group.Overlap = CalculateOverlap(overlapBlock, groupSamples);
+        }
+      }
+    }
+
+    // Step 6: Global analyses (equipment, location, elevation)
     var allSamples = flights.SelectMany(f => f.SampledPhotos).ToList();
 
-    // Step 5: Extract equipment info from the first available sample
     log("Extracting equipment info...");
     var equipment = ExtractEquipmentInfo(allSamples);
 
-    // Step 6: Compute geographic location summary
     log("Computing location summary...");
     var location = ComputeLocationInfo(allSamples);
 
-    // Step 7: Analyze gimbal angles and smart oblique correlation
-    log("Analyzing gimbal configuration...");
-    var gimbal = AnalyzeGimbal(allSamples);
-
-    // Step 8: Calculate forward and side overlap
-    log("Calculating overlap...");
-    var overlap = CalculateOverlap(overlapBlock, allSamples);
-
-    // Step 9: Query elevation API for AGL analysis
     ElevationAnalysis? elevation = null;
 
     if (!options.SkipElevation)
@@ -84,7 +107,7 @@ public static class MissionAnalyzer
       elevation = await AnalyzeElevationAsync(allSamples, log);
     }
 
-    // Step 10: Compile the complete mission report
+    // Step 7: Compile the complete mission report
     log("Compiling report...");
     var dates = flights.Select(f => DateOnly.FromDateTime(f.StartTime)).Distinct().OrderBy(d => d).ToList();
 
@@ -92,8 +115,6 @@ public static class MissionAnalyzer
     {
       Equipment = equipment,
       Location = location,
-      Gimbal = gimbal,
-      Overlap = overlap,
       Elevation = elevation,
       TotalPhotos = allFiles.Count,
       CaptureDays = dates.Count,
@@ -102,15 +123,7 @@ public static class MissionAnalyzer
 
     report.Flights.AddRange(flights);
     report.Dates.AddRange(dates);
-
-    // Battery swaps: count transitions between flights on the same day
-    int swaps = 0;
-    for (int i = 1; i < flights.Count; i++)
-    {
-      if (flights[i].StartTime.Date == flights[i - 1].StartTime.Date)
-        swaps++;
-    }
-    report.BatterySwaps = swaps;
+    report.CaptureGroups.AddRange(captureGroups);
 
     return report;
   }
@@ -118,20 +131,155 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 1: Filename parsing
+  #region Flight classification by altitude band
 
   /// <summary>
-  /// Lists all JPEG files in the directory and parses DJI filename conventions
-  /// to extract timestamps and sequence numbers. Sorted by (timestamp, sequence).
+  /// Classifies flights into capture groups based on altitude stability and band.
+  ///
+  /// Algorithm:
+  /// 1. For each flight, compute median relative altitude and std dev from sampled photos
+  /// 2. Flights with altitude std dev &gt; threshold → unclassified (varying altitude)
+  /// 3. Stable-altitude flights are grouped by median altitude rounded to nearest 5m
+  /// 4. Groups with fewer than MinPhotosPerCaptureGroup photos → merged into unclassified
+  /// 5. Groups ordered by photo count (largest first); unclassified group appended last
   /// </summary>
-  private static List<DjiFileInfo> ParseDjiFilenames(string directory)
+  private static List<CaptureGroup> ClassifyFlightsIntoCaptureGroups(List<FlightInfo> flights)
   {
-    // Enumerate all JPEG files in the directory (non-recursive).
-    // Use a single "*.jpg" pattern; on Windows (NTFS), this is case-insensitive
-    // and already matches *.JPG. Deduplication via HashSet handles any edge cases.
-    var jpegFiles = Directory.EnumerateFiles(directory, "*.jpg", SearchOption.TopDirectoryOnly)
-      .Concat(Directory.EnumerateFiles(directory, "*.jpeg", SearchOption.TopDirectoryOnly));
-    var deduplicatedFiles = new HashSet<string>(jpegFiles, StringComparer.OrdinalIgnoreCase);
+    var stableFlights = new List<(FlightInfo Flight, double RoundedAltitude)>();
+    var unstableFlights = new List<FlightInfo>();
+
+    foreach (var flight in flights)
+    {
+      var altitudes = flight.SampledPhotos
+        .Where(p => p.RelativeAltitude != null)
+        .Select(p => p.RelativeAltitude!.Value)
+        .ToList();
+
+      // Flights with too few altitude samples can't be classified
+      if (altitudes.Count < 3)
+      {
+        flight.CaptureGroupLabel = "Mixed";
+        unstableFlights.Add(flight);
+        continue;
+      }
+
+      double stdDev = MathHelpers.StdDev(altitudes);
+
+      if (stdDev > AltitudeStabilityThreshold)
+      {
+        // Varying altitude within this flight → unclassified
+        flight.CaptureGroupLabel = "Mixed";
+        unstableFlights.Add(flight);
+      }
+      else
+      {
+        // Stable altitude → candidate for altitude-band grouping
+        double median = MathHelpers.Median(altitudes);
+        double rounded = Math.Round(median / 5) * 5;
+        stableFlights.Add((flight, rounded));
+      }
+    }
+
+    // Group stable flights by rounded altitude, largest group first
+    var altitudeBands = stableFlights
+      .GroupBy(sf => sf.RoundedAltitude)
+      .OrderByDescending(g => g.Sum(sf => sf.Flight.PhotoCount))
+      .ToList();
+
+    var captureGroups = new List<CaptureGroup>();
+
+    foreach (var band in altitudeBands)
+    {
+      int totalPhotos = band.Sum(sf => sf.Flight.PhotoCount);
+
+      if (totalPhotos >= MinPhotosPerCaptureGroup)
+      {
+        string shortLabel = $"{band.Key:F0} m";
+
+        var group = new CaptureGroup
+        {
+          Label = $"Capture at {band.Key:F0} m",
+          BandAltitude = band.Key,
+          IsUnclassified = false,
+        };
+
+        foreach (var (flight, _) in band)
+        {
+          flight.CaptureGroupLabel = shortLabel;
+          group.Flights.Add(flight);
+        }
+
+        captureGroups.Add(group);
+      }
+      else
+      {
+        // Below threshold → merge into unclassified
+        foreach (var (flight, _) in band)
+        {
+          flight.CaptureGroupLabel = "Mixed";
+          unstableFlights.Add(flight);
+        }
+      }
+    }
+
+    // Add catch-all group if there are unclassified flights
+    if (unstableFlights.Count > 0)
+    {
+      var catchAll = new CaptureGroup
+      {
+        Label = "Varying altitude",
+        BandAltitude = null,
+        IsUnclassified = true,
+      };
+      catchAll.Flights.AddRange(unstableFlights);
+      captureGroups.Add(catchAll);
+    }
+
+    // Compute altitude ranges for all groups (useful for display)
+    foreach (var group in captureGroups)
+    {
+      var altitudes = group.Flights
+        .SelectMany(f => f.SampledPhotos)
+        .Where(p => p.RelativeAltitude != null)
+        .Select(p => p.RelativeAltitude!.Value)
+        .ToList();
+
+      if (altitudes.Count > 0)
+      {
+        group.MinAltitude = altitudes.Min();
+        group.MaxAltitude = altitudes.Max();
+      }
+    }
+
+    return captureGroups;
+  }
+
+  #endregion
+
+
+  #region Filename parsing
+
+  /// <summary>
+  /// Lists all JPEG files across one or more directories (searched recursively) and
+  /// parses DJI filename conventions to extract timestamps and sequence numbers.
+  /// Sorted by (timestamp, sequence). Deduplicates by full path (case-insensitive).
+  /// </summary>
+  private static List<DjiFileInfo> ParseDjiFilenames(string[] directories)
+  {
+    // Enumerate all JPEG files across all input directories (recursive).
+    // Use "*.jpg" pattern; on Windows (NTFS), this is case-insensitive
+    // and already matches *.JPG. Deduplication via HashSet handles any edge cases
+    // and overlapping directories.
+    var deduplicatedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var directory in directories)
+    {
+      foreach (var file in Directory.EnumerateFiles(directory, "*.jpg", SearchOption.AllDirectories))
+        deduplicatedFiles.Add(file);
+
+      foreach (var file in Directory.EnumerateFiles(directory, "*.jpeg", SearchOption.AllDirectories))
+        deduplicatedFiles.Add(file);
+    }
 
     var parsed = new List<DjiFileInfo>();
 
@@ -156,7 +304,7 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 2: Flight segmentation
+  #region Flight segmentation
 
   /// <summary>
   /// Groups photos into flights by detecting timestamp gaps and DJI sequence resets.
@@ -193,9 +341,9 @@ public static class MissionAnalyzer
     rawSegments.Add(currentSegment);
 
     // Phase 2: Merge brief-pause segments into flights
-    // A pause is a battery swap if:
+    // A pause indicates a new flight (power cycle) if:
     //   - Gap >= 120 seconds, OR
-    //   - The DJI sequence counter resets to 1 (indicating a power cycle)
+    //   - The DJI sequence counter resets to 1 (indicating the drone was powered off and on)
     var flights = new List<FlightInfo>();
     var mergedPhotos = new List<DjiFileInfo>(rawSegments[0]);
 
@@ -214,7 +362,7 @@ public static class MissionAnalyzer
       }
       else
       {
-        // Battery swap or power cycle; start new flight
+        // Power cycle; start new flight
         flights.Add(CreateFlightInfo(mergedPhotos, flights.Count + 1));
         mergedPhotos = new List<DjiFileInfo>(currSegment);
       }
@@ -244,7 +392,7 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 3: Metadata sampling
+  #region Metadata sampling
 
   /// <summary>
   /// Reads full EXIF + XMP metadata from evenly-spaced sample photos within a flight.
@@ -289,7 +437,7 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 4: Consecutive block for overlap
+  #region Consecutive block for overlap
 
   /// <summary>
   /// Reads a consecutive block of photos from the middle of the longest primary-altitude flight.
@@ -372,7 +520,7 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 5: Equipment info
+  #region Equipment info
 
   /// <summary>
   /// Extracts equipment identification from the first available sampled photo.
@@ -393,7 +541,6 @@ public static class MissionAnalyzer
     info.CameraSerialNumber = reference.CameraSerialNumber ?? "Unknown";
     info.FocalLengthMm = reference.FocalLengthMm ?? 0;
     info.FocalLength35mm = reference.FocalLength35mm ?? 0;
-    info.CalibratedFocalLengthPx = reference.CalibratedFocalLength ?? 0;
     info.ImageWidth = reference.ImageWidth ?? 0;
     info.ImageHeight = reference.ImageHeight ?? 0;
     info.ShutterType = reference.ShutterType ?? "Unknown";
@@ -410,13 +557,17 @@ public static class MissionAnalyzer
       info.SensorHeightMm = info.SensorWidthMm * aspectRatio;
     }
 
+    // Use DJI XMP calibrated FL if available, otherwise derive from EXIF
+    info.CalibratedFocalLengthPx = reference.CalibratedFocalLength
+      ?? DeriveCalFocalLengthPx(samples);
+
     return info;
   }
 
   #endregion
 
 
-  #region Step 6: Location info
+  #region Location info
 
   /// <summary>
   /// Computes the geographic center, bounding box, and coverage area from GPS positions.
@@ -464,7 +615,7 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 7: Gimbal analysis
+  #region Gimbal analysis
 
   /// <summary>
   /// Analyzes gimbal angles across all sampled photos to determine the smart oblique configuration.
@@ -531,6 +682,7 @@ public static class MissionAnalyzer
       ObliqueBackwardCount = backwardLook.Count,
       HorizonCount = horizon.Count + other.Count,
       TotalSampled = withGimbal.Count,
+      MeanPitch = withGimbal.Average(p => p.GimbalPitch!.Value),
       MeanForwardPitch = forwardPitch,
       MeanBackwardPitch = backwardPitch,
       Explanation = explanation,
@@ -540,7 +692,7 @@ public static class MissionAnalyzer
   #endregion
 
 
-  #region Step 8: Overlap calculation
+  #region Overlap calculation
 
   /// <summary>
   /// Calculates forward (along-track) and side (cross-track) overlap percentages.
@@ -571,11 +723,15 @@ public static class MissionAnalyzer
           .First().Key
       : 100;
 
-    // Get calibrated focal length in pixels
+    // Get calibrated focal length in pixels (from DJI XMP, or derived from EXIF)
     double focalPx = allSamples
-      .FirstOrDefault(p => p.CalibratedFocalLength != null)?.CalibratedFocalLength ?? 3725;
-    int imgW = allSamples.FirstOrDefault(p => p.ImageWidth != null)?.ImageWidth ?? 5280;
-    int imgH = allSamples.FirstOrDefault(p => p.ImageHeight != null)?.ImageHeight ?? 3956;
+      .FirstOrDefault(p => p.CalibratedFocalLength != null)?.CalibratedFocalLength
+      ?? DeriveCalFocalLengthPx(allSamples);
+    int imgW = allSamples.FirstOrDefault(p => p.ImageWidth != null)?.ImageWidth ?? 0;
+    int imgH = allSamples.FirstOrDefault(p => p.ImageHeight != null)?.ImageHeight ?? 0;
+
+    if (focalPx <= 0 || imgW == 0 || imgH == 0)
+      return result;
 
     // Ground sample distance (meters/pixel)
     result.GsdMeters = result.PrimaryAltitude / focalPx;
@@ -784,10 +940,40 @@ public static class MissionAnalyzer
     return modalBearing;
   }
 
+  /// <summary>
+  /// Derives calibrated focal length in pixels from EXIF data when the DJI XMP
+  /// <c>CalibratedFocalLength</c> field is absent.
+  ///
+  /// Formula: <c>focal_length_mm * image_width_px / sensor_width_mm</c>
+  ///
+  /// Sensor width is derived from the actual/35mm-equivalent focal length ratio:
+  /// <c>sensor_width_mm = focal_length_mm * 36.0 / focal_length_35mm</c>
+  ///
+  /// Both values are standard EXIF fields available on virtually all cameras.
+  /// Returns 0 if the required EXIF fields are missing.
+  /// </summary>
+  private static double DeriveCalFocalLengthPx(List<PhotoMetadata> samples)
+  {
+    var reference = samples.FirstOrDefault(p =>
+      p.FocalLengthMm != null && p.FocalLengthMm > 0 &&
+      p.FocalLength35mm != null && p.FocalLength35mm > 0 &&
+      p.ImageWidth != null && p.ImageWidth > 0);
+
+    if (reference == null)
+      return 0;
+
+    double sensorWidthMm = reference.FocalLengthMm!.Value * 36.0 / reference.FocalLength35mm!.Value;
+
+    if (sensorWidthMm <= 0)
+      return 0;
+
+    return reference.FocalLengthMm!.Value * reference.ImageWidth!.Value / sensorWidthMm;
+  }
+
   #endregion
 
 
-  #region Step 9: Elevation / AGL analysis
+  #region Elevation / AGL analysis
 
   /// <summary>
   /// Queries ground elevation for sampled GPS positions and computes AGL statistics.
